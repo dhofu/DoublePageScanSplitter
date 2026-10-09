@@ -29,9 +29,9 @@ If the gutter is almost exactly vertical (less than 0.1°), both modes make a pl
 Even the online version processes everything in your browser and never uploads your images.
 
 1. Open the online version, or download [`code/DoublePageScanSplitter.html`](code/DoublePageScanSplitter.html) and open it in your browser. Double-clicking the file works, and it runs offline.
-2. Click **Open images** or **Open folder**, or drag JPG files onto the window.
+2. Click **Open images** or **Open folder**, or drag JPG, PNG or TIFF files onto the window.
 3. *Optional, Chrome/Edge only:* click **Output folder…** to write the split pages straight into a folder. In other browsers, or if you don't pick a folder, the results are offered as a ZIP download.
-4. Choose the **Mode** (`rotate` or `cut`), the **JPEG** quality, the **Fill** colour and, if you like, your name as **Executor** (it's recorded in `timing.csv`).
+4. Choose the **Mode** (`rotate` or `cut`), the **JPEG** quality (used for JPEG output only), the **Fill** colour and, if you like, your name as **Executor** (it's recorded in `timing.csv`).
 5. Click the gutter of each image twice. A magnifier next to the cursor helps you place the points precisely.
 6. When you're done, click **Finish & export**.
 
@@ -76,9 +76,25 @@ Subfolders of `sourceDir` are processed recursively and their structure is mirro
 
 [`code/DoublePageScanSplitter_v1.ipynb`](code/DoublePageScanSplitter_v1.ipynb) is the original version, which takes one click per image and splits strictly vertically. It's kept for reference.
 
+## Image formats
+
+Both versions read **JPEG** (`.jpg`, `.jpeg`), **PNG** (`.png`) and **TIFF** (`.tif`, `.tiff`). The split pages are saved in the same format and with the same extension as the source image:
+
+| Source | Output |
+|---|---|
+| JPEG | JPEG with the chosen quality (default 95) |
+| PNG | PNG (lossless) |
+| TIFF | TIFF, Deflate compressed (lossless) |
+
+Notes:
+
+- Output is always 8-bit colour. 16-bit images are reduced to 8 bit and greyscale images are saved as RGB. Resolution (DPI) metadata is not carried over.
+- Only the first page of a multi-page TIFF is read.
+- Browsers can't read TIFF on their own, so the browser app has its own TIFF reader. It handles uncompressed, LZW, Deflate, PackBits and JPEG-compressed TIFFs (1/2/4/8/16 bit; grey, RGB, palette or CMYK; strips or tiles). It doesn't support CCITT fax compression (common in black-and-white TIFFs) or BigTIFF. Use the notebook for those files.
+
 ## Output
 
-For every split image `NAME.jpg` the tool writes two files:
+For every split image `NAME.jpg` (or `.png`, `.tif`, …) the tool writes two files:
 
 - `NAME_L_verso.jpg`: the left page
 - `NAME_R_recto.jpg`: the right page

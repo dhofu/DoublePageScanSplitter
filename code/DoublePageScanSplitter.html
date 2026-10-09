@@ -9,6 +9,7 @@
   Open this file directly in Chrome/Edge (recommended: output is written straight into a folder)
   or Firefox/Safari (output is offered as a ZIP download).
 
+  Reads JPEG, PNG and TIFF; the split pages are saved in the format of the source image.
   Per image: click twice on the gutter (top + bottom). Right click / S = no split.
   Same logic as DoublePageScanSplitter_v2.ipynb.
 -->
@@ -68,7 +69,7 @@
 <header>
   <strong>DoublePageScanSplitter</strong>
   <div class="group">
-    <label class="btn">Open images<input type="file" id="inFiles" accept=".jpg,.jpeg,image/jpeg" multiple hidden></label>
+    <label class="btn">Open images<input type="file" id="inFiles" accept=".jpg,.jpeg,.png,.tif,.tiff,image/jpeg,image/png,image/tiff" multiple hidden></label>
     <label class="btn">Open folder<input type="file" id="inDir" webkitdirectory hidden></label>
   </div>
   <div class="group">
@@ -81,7 +82,7 @@
       <option value="rotate">rotate (deskew, then split)</option>
       <option value="cut">cut (slanted cut, no resampling)</option>
     </select>
-    <label for="quality">JPEG</label><input id="quality" type="number" min="50" max="100" value="95">
+    <label for="quality" title="JPEG quality (PNG and TIFF are saved lossless)">JPEG</label><input id="quality" type="number" min="50" max="100" value="95" title="JPEG quality (PNG and TIFF are saved lossless)">
     <label for="fill">Fill</label><input id="fill" type="color" value="#ffffff">
     <label for="executor">Executor</label><input id="executor" type="text" size="8">
   </div>
@@ -93,7 +94,7 @@
     <canvas id="cv"></canvas>
     <canvas id="loupe" width="220" height="220"></canvas>
     <div id="drop">
-      <p><b>Open images</b> or <b>Open folder</b> (or drop JPGs here).</p>
+      <p><b>Open images</b> or <b>Open folder</b> (or drop JPG, PNG or TIFF files here).</p>
       <p>For each double page, click on the gutter <b>twice</b>: once near the top, once near the bottom.
          The image is then split along that line and the next image opens.</p>
       <p><kbd>right click</kbd> / <kbd>S</kbd> no split &nbsp; <kbd>R</kbd> reset clicks &nbsp;
@@ -195,6 +196,194 @@ function splitCut(bmp, p1, p2, fill) {
   return [l, r];
 }
 
+// ---------- TIFF (browsers can neither decode nor encode TIFF themselves) ----------
+// Reads the first image of a TIFF: 1/2/4/8/16 bit, grey, RGB, palette or CMYK, with or without alpha,
+// strips or tiles, uncompressed, LZW, Deflate, PackBits or JPEG. Writes 8 bit RGB, Deflate compressed (lossless).
+const isTiff = name => /\.tiff?$/i.test(name);
+
+const streamBytes = (bytes, stream) =>
+  new Response(new Blob([bytes]).stream().pipeThrough(stream)).arrayBuffer().then(b => new Uint8Array(b));
+
+function tiffTags(dv, le) {
+  const version = dv.getUint16(2, le);
+  if (version !== 42) throw new Error(version === 43 ? 'BigTIFF is not supported' : 'not a TIFF file');
+  const ifd = dv.getUint32(4, le), n = dv.getUint16(ifd, le), tags = {};
+  const SIZE = { 1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8 };
+  for (let k = 0; k < n; k++) {
+    const e = ifd + 2 + k * 12, tag = dv.getUint16(e, le), type = dv.getUint16(e + 2, le), count = dv.getUint32(e + 4, le);
+    const size = SIZE[type] || 1, off = size * count <= 4 ? e + 8 : dv.getUint32(e + 8, le);
+    if (size === 1) { tags[tag] = new Uint8Array(dv.buffer, off, count); continue; }
+    if (type !== 3 && type !== 4) continue; // rationals, floats etc. are not needed for decoding
+    tags[tag] = Array.from({ length: count }, (_, j) => type === 3 ? dv.getUint16(off + 2 * j, le) : dv.getUint32(off + 4 * j, le));
+  }
+  return tags;
+}
+
+async function decodeTiff(file) {
+  const buf = await file.arrayBuffer(), dv = new DataView(buf), u8 = new Uint8Array(buf);
+  const le = dv.getUint16(0) === 0x4949;
+  if (!le && dv.getUint16(0) !== 0x4D4D) throw new Error('not a TIFF file');
+  const tags = tiffTags(dv, le), tag = (t, def) => tags[t] ? tags[t][0] : def;
+  const W = tag(256), H = tag(257), bits = tag(258, 1), spp = tag(277, 1), comp = tag(259, 1);
+  const photo = tag(262, spp >= 3 ? 2 : 1), predictor = tag(317, 1), planar = tag(284, 1) === 2 && spp > 1;
+  const color = { 0: 1, 1: 1, 3: 1, 2: 3, 6: 3, 5: 4 }[photo]; // colour samples per pixel
+  if (!color) throw new Error('TIFF colour model ' + photo + ' is not supported');
+  if (![1, 2, 4, 8, 16].includes(bits)) throw new Error(bits + ' bit TIFFs are not supported');
+  if (tag(339, 1) === 3) throw new Error('floating point TIFFs are not supported');
+  if (photo === 6 && comp !== 7) throw new Error('YCbCr TIFFs are only supported with JPEG compression');
+  if (planar && photo !== 0 && photo !== 1 && photo !== 2) throw new Error('planar TIFFs are only supported for grey and RGB');
+  if (predictor !== 1 && predictor !== 2) throw new Error('TIFF predictor ' + predictor + ' is not supported');
+  const alpha = spp > color && (tag(338) === 1 || tag(338) === 2) ? color : -1; // sample index of the alpha channel
+
+  // the image is stored in blocks: strips (full width) or tiles; planar images have one set of blocks per sample
+  const tiled = !!tags[322];
+  const bw = tiled ? tag(322) : W, bh = tiled ? tag(323) : Math.min(tag(278, H), H);
+  const offsets = tags[tiled ? 324 : 273], counts = tags[tiled ? 325 : 279];
+  if (!W || !H || !offsets || !counts) throw new Error('incomplete TIFF file');
+  const across = Math.ceil(W / bw), perPlane = across * Math.ceil(H / bh), sppB = planar ? 1 : spp;
+  const rowBytes = Math.ceil(bw * sppB * bits / 8), max = 2 ** bits - 1;
+  const lut = bits <= 8 ? Uint8Array.from({ length: max + 1 }, (_, v) => Math.round(v * 255 / max)) : null;
+  const to8 = bits === 16 ? v => v >> 8 : v => lut[v];
+  const cmap = tags[320], nc = 2 ** bits;
+  if (photo === 3 && !cmap) throw new Error('TIFF palette is missing');
+
+  const out = new ImageData(W, H), px = out.data;
+  for (let b = 0; b < offsets.length; b++) {
+    const plane = Math.floor(b / perPlane), bi = b % perPlane;
+    const x0 = (bi % across) * bw, y0 = Math.floor(bi / across) * bh;
+    const w = Math.min(bw, W - x0), h = Math.min(bh, H - y0), rows = tiled ? bh : h;
+    let data = u8.subarray(offsets[b], offsets[b] + counts[b]);
+    if (comp === 7) { await copyJpegBlock(data, tags[347], px, W, x0, y0, w, h); continue; }
+    data = comp === 1 ? data : comp === 5 ? lzwDecode(data, rowBytes * rows) :
+           comp === 8 || comp === 32946 ? await streamBytes(data, new DecompressionStream('deflate')) :
+           comp === 32773 ? packBitsDecode(data, rowBytes * rows) : null;
+    if (!data) throw new Error('TIFF compression ' + comp + ' is not supported');
+    const s = unpackSamples(data, rows, bw * sppB, bits, le);
+    if (predictor === 2) {
+      for (let y = 0; y < rows; y++)
+        for (let i = y * bw * sppB + sppB, e = (y + 1) * bw * sppB; i < e; i++) s[i] = (s[i] + s[i - sppB]) & max;
+    }
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const d = ((y0 + y) * W + x0 + x) * 4, i = (y * bw + x) * sppB;
+      if (planar) {
+        const v = to8(s[i]);
+        if (plane === alpha) px[d + 3] = v;
+        else if (color === 1) { px[d] = px[d + 1] = px[d + 2] = photo === 0 ? 255 - v : v; px[d + 3] = 255; }
+        else if (plane < 3) { px[d + plane] = v; if (plane === 0) px[d + 3] = 255; }
+        continue;
+      }
+      if (photo === 0 || photo === 1) { const v = to8(s[i]); px[d] = px[d + 1] = px[d + 2] = photo === 0 ? 255 - v : v; }
+      else if (photo === 2) { px[d] = to8(s[i]); px[d + 1] = to8(s[i + 1]); px[d + 2] = to8(s[i + 2]); }
+      else if (photo === 3) { const k = s[i]; px[d] = cmap[k] >> 8; px[d + 1] = cmap[nc + k] >> 8; px[d + 2] = cmap[2 * nc + k] >> 8; }
+      else { const k = 255 - to8(s[i + 3]); px[d] = (255 - to8(s[i])) * k / 255; px[d + 1] = (255 - to8(s[i + 1])) * k / 255; px[d + 2] = (255 - to8(s[i + 2])) * k / 255; }
+      px[d + 3] = alpha >= 0 ? to8(s[i + alpha]) : 255;
+    }
+  }
+  return out;
+}
+
+// sample values of a block, one row after the other (rows of bits < 8 start on a full byte)
+function unpackSamples(bytes, rows, n, bits, le) {
+  if (bits === 8) return bytes;
+  const s = bits === 16 ? new Uint16Array(rows * n) : new Uint8Array(rows * n);
+  if (bits === 16) {
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength), m = Math.min(s.length, bytes.length >> 1);
+    for (let i = 0; i < m; i++) s[i] = dv.getUint16(2 * i, le);
+    return s;
+  }
+  const rowBytes = Math.ceil(n * bits / 8), mask = (1 << bits) - 1;
+  for (let y = 0; y < rows; y++) for (let x = 0; x < n; x++) {
+    const bit = x * bits;
+    s[y * n + x] = (bytes[y * rowBytes + (bit >> 3)] >> (8 - bits - (bit & 7))) & mask;
+  }
+  return s;
+}
+
+// JPEG compressed block: the shared tables (without their EOI) go in front of the block (without its SOI)
+async function copyJpegBlock(data, tables, px, W, x0, y0, w, h) {
+  const parts = tables && tables.length > 4 ? [tables.subarray(0, tables.length - 2), data.subarray(2)] : [data];
+  const bmp = await createImageBitmap(new Blob(parts, { type: 'image/jpeg' }));
+  const [c, g] = newCanvas(bmp.width, bmp.height, '#fff');
+  g.drawImage(bmp, 0, 0); bmp.close();
+  const src = g.getImageData(0, 0, c.width, c.height).data, cw = Math.min(w, c.width);
+  for (let y = 0; y < Math.min(h, c.height); y++) px.set(src.subarray(y * c.width * 4, (y * c.width + cw) * 4), ((y0 + y) * W + x0) * 4);
+  c.width = c.height = 0;
+}
+
+// TIFF flavour of LZW: MSB first, code width grows one code early
+function lzwDecode(src, size) {
+  let out = new Uint8Array(size || src.length * 4), op = 0;
+  const start = new Int32Array(4096), len = new Int32Array(4096); // table entries are runs of the output
+  let next = 258, width = 9, bitPos = 0, prev = -1, prevPos = 0, prevLen = 0;
+  const ensure = n => { if (op + n > out.length) { const o = new Uint8Array(Math.max(out.length * 2, op + n)); o.set(out); out = o; } };
+  while (bitPos + width <= src.length * 8) {
+    const p = bitPos >> 3, v = (src[p] << 16) | (src[p + 1] << 8) | src[p + 2];
+    const code = (v >> (24 - (bitPos & 7) - width)) & ((1 << width) - 1);
+    bitPos += width;
+    if (code === 256) { next = 258; width = 9; prev = -1; continue; }
+    if (code === 257) break;
+    const pos = op;
+    if (code < 256) { ensure(1); out[op++] = code; }
+    else if (code < next) { const l = len[code]; ensure(l); out.copyWithin(op, start[code], start[code] + l); op += l; }
+    else if (code === next && prev >= 0) { ensure(prevLen + 1); out.copyWithin(op, prevPos, prevPos + prevLen); op += prevLen; out[op++] = out[prevPos]; }
+    else throw new Error('corrupt LZW data');
+    if (prev >= 0 && next < 4096) { start[next] = prevPos; len[next] = prevLen + 1; next++; }
+    prev = code; prevPos = pos; prevLen = op - pos;
+    if (next + 1 >= 1 << width && width < 12) width++;
+  }
+  return out.subarray(0, op);
+}
+
+function packBitsDecode(src, size) {
+  const out = new Uint8Array(size);
+  for (let i = 0, o = 0; i < src.length && o < size;) {
+    const n = (src[i++] << 24) >> 24;
+    if (n >= 0) { out.set(src.subarray(i, i + Math.min(n + 1, size - o)), o); o += n + 1; i += n + 1; }
+    else if (n !== -128) { out.fill(src[i++], o, Math.min(size, o - n + 1)); o += 1 - n; }
+  }
+  return out;
+}
+
+async function encodeTiff(canvas) {
+  const W = canvas.width, H = canvas.height, rgba = canvas.getContext('2d').getImageData(0, 0, W, H).data;
+  const rowBytes = W * 3, rps = Math.max(1, Math.min(H, Math.floor(262144 / rowBytes))); // ~256 KB per strip
+  const strips = [];
+  for (let y0 = 0; y0 < H; y0 += rps) {
+    const rows = Math.min(rps, H - y0), raw = new Uint8Array(rows * rowBytes);
+    for (let i = 0, s = y0 * W * 4; i < raw.length; i += 3, s += 4) { raw[i] = rgba[s]; raw[i + 1] = rgba[s + 1]; raw[i + 2] = rgba[s + 2]; }
+    for (let y = 0; y < rows; y++) for (let i = (y + 1) * rowBytes - 1; i >= y * rowBytes + 3; i--) raw[i] -= raw[i - 3]; // predictor 2
+    strips.push(streamBytes(raw, new CompressionStream('deflate')));
+  }
+  const data = await Promise.all(strips);
+  // IFD entries, sorted by tag: [tag, type (2 = ASCII, 3 = SHORT, 4 = LONG), values]
+  const entries = [[256, 4, [W]], [257, 4, [H]], [258, 3, [8, 8, 8]], [259, 3, [8]], [262, 3, [2]],
+    [273, 4, data.map(() => 0)], [277, 3, [3]], [278, 4, [rps]], [279, 4, data.map(d => d.length)],
+    [284, 3, [1]], [305, 2, 'DoublePageScanSplitter\0'], [317, 3, [2]]];
+  const size = (type, v) => (type === 2 ? 1 : type === 3 ? 2 : 4) * v.length;
+  const ifdEnd = 8 + 2 + entries.length * 12 + 4;
+  let pos = ifdEnd;
+  for (const [, type, v] of entries) if (size(type, v) > 4) pos += size(type, v) + (size(type, v) & 1);
+  const offsets = entries[5][2];
+  data.forEach((d, j) => { offsets[j] = pos; pos += d.length; });
+  const buf = new Uint8Array(pos), dv = new DataView(buf.buffer);
+  buf.set([0x49, 0x49, 42, 0, 8, 0, 0, 0]);
+  dv.setUint16(8, entries.length, true);
+  let ext = ifdEnd;
+  entries.forEach(([tag, type, v], k) => {
+    const e = 10 + k * 12, bytes = size(type, v);
+    let p = e + 8;
+    dv.setUint16(e, tag, true); dv.setUint16(e + 2, type, true); dv.setUint32(e + 4, v.length, true);
+    if (bytes > 4) { dv.setUint32(p, ext, true); p = ext; ext += bytes + (bytes & 1); }
+    for (let j = 0; j < v.length; j++) {
+      if (type === 2) buf[p + j] = v.charCodeAt(j);
+      else if (type === 3) dv.setUint16(p + 2 * j, v[j], true);
+      else dv.setUint32(p + 4 * j, v[j], true);
+    }
+  });
+  data.forEach((d, j) => buf.set(d, offsets[j]));
+  return new Blob([buf], { type: 'image/tiff' });
+}
+
 // ---------- loading ----------
 function relOf(f) {
   const p = f.webkitRelativePath;
@@ -202,8 +391,8 @@ function relOf(f) {
 }
 
 function setFiles(fileList) {
-  const files = [...fileList].filter(f => /\.jpe?g$/i.test(f.name));
-  if (!files.length) { setStatus('No JPG files found.'); return; }
+  const files = [...fileList].filter(f => /\.(jpe?g|png|tiff?)$/i.test(f.name));
+  if (!files.length) { setStatus('No JPG, PNG or TIFF files found.'); return; }
   if (items.some(it => it.status !== 'pending') &&
       !confirm('Discard the current session and load the new images?')) return;
   files.sort((a, b) => relOf(a).localeCompare(relOf(b), undefined, { numeric: true }));
@@ -220,7 +409,7 @@ function setFiles(fileList) {
 }
 
 function getBitmap(i) {
-  if (!bitmapCache.has(i)) bitmapCache.set(i, createImageBitmap(items[i].file));
+  if (!bitmapCache.has(i)) bitmapCache.set(i, isTiff(items[i].file.name) ? decodeTiff(items[i].file).then(createImageBitmap) : createImageBitmap(items[i].file));
   return bitmapCache.get(i);
 }
 
@@ -376,10 +565,15 @@ async function processItem(i, { mode, fill, quality }) {
     const bmp = await getBitmap(i);
     const [p1, p2] = it.pts;
     const [l, r] = mode === 'rotate' ? splitRotate(bmp, p1, p2, fill) : splitCut(bmp, p1, p2, fill);
-    const base = it.rel.replace(/\.[^./]+$/, '');
-    const names = [base + '_L_verso.jpg', base + '_R_recto.jpg'];
+    // the split pages keep the format and extension of the source image
+    const ext = it.rel.match(/\.[^./]+$/)[0], base = it.rel.slice(0, -ext.length);
+    const names = [base + '_L_verso' + ext, base + '_R_recto' + ext];
     for (const [c, name] of [[l, names[0]], [r, names[1]]]) {
-      const blob = await new Promise((res, rej) => c.toBlob(b => b ? res(b) : rej(new Error('JPEG encoding failed')), 'image/jpeg', quality));
+      const blob = isTiff(name) ? await encodeTiff(c) :
+        await new Promise((res, rej) => {
+          const type = /\.png$/i.test(name) ? 'image/png' : 'image/jpeg';
+          c.toBlob(b => b ? res(b) : rej(new Error(type + ' encoding failed')), type, quality);
+        });
       c.width = c.height = 0;
       await writeOutput(name, blob);
     }
@@ -475,7 +669,7 @@ $('finishBtn').addEventListener('click', async () => {
   $('finishBtn').disabled = false;
 });
 
-// minimal ZIP writer (stored, no compression - JPEGs do not compress anyway)
+// minimal ZIP writer (stored, no compression - the images are already compressed)
 const CRC_TABLE = (() => {
   const t = new Uint32Array(256);
   for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
